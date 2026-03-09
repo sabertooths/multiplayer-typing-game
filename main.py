@@ -336,7 +336,7 @@ CLIENT_HTML = """<!doctype html>
   </style>
 </head>
 <body>
-  <h2>Multiplayer Typing (Host = Spectator)</h2>
+  <h2>Multiplayer Typing </h2>
 
   <div class="card">
     <div class="row">
