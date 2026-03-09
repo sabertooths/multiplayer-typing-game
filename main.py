@@ -1,29 +1,38 @@
 from __future__ import annotations
 
 import json
+import os
+import random
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def now_mono() -> float:
+    return time.monotonic()
+
+
+async def send(ws: WebSocket, payload: dict):
+    await ws.send_text(json.dumps(payload))
+
+
+# -----------------------------
+# Game State
+# -----------------------------
 DEFAULT_TEXTS = [
     "Please review the remittance advice and confirm whether the beneficiary details match the invoice.",
     "After payment is released, we will inform MDM to re-block this vendor to avoid future postings.",
     "Kindly assist to approve the payment file. It has been fully signed off but is still pending approval.",
     "For SOA tracking, update the ticket status and include remarks for any exception handling required."
 ]
-
-
-def now_mono() -> float:
-    return time.monotonic()
-
-
-async def safe_json_send(ws: WebSocket, payload: dict):
-    await ws.send_text(json.dumps(payload))
 
 
 @dataclass
@@ -44,7 +53,7 @@ class Player:
 @dataclass
 class RelayTeamState:
     name: str
-    members: List[str] = field(default_factory=list)
+    members: List[str] = field(default_factory=list)  # in join order
     segments: List[str] = field(default_factory=list)
     runner_idx: int = 0
     segment_progress: int = 0
@@ -57,73 +66,106 @@ class RelayTeamState:
 class Room:
     room: str
 
-    # Host is a SPECTATOR (not a player)
+    # Roles
     host_name: Optional[str] = None
     host_ws: Optional[WebSocket] = None
-
-    players: Dict[str, Player] = field(default_factory=dict)
     spectators: Dict[str, WebSocket] = field(default_factory=dict)
+    players: Dict[str, Player] = field(default_factory=dict)
 
+    # Game
     started: bool = False
     mode: Optional[str] = None  # "ffa" or "relay"
     text: str = ""
     start_mono: float = 0.0
 
+    # Host provided text pool (one per line)
+    text_pool: List[str] = field(default_factory=list)
+
+    # Relay
     relay_teams: Dict[str, RelayTeamState] = field(default_factory=dict)
 
 
 rooms: Dict[str, Room] = {}
 
 
+def compute_stats(text: str, typed: str, elapsed_sec: float) -> dict:
+    if elapsed_sec <= 0:
+        elapsed_sec = 0.001
+
+    target = text
+    typed_eff = typed[:len(target)]
+    correct = sum(1 for i, ch in enumerate(typed_eff) if i < len(target) and ch == target[i])
+    errors = len(typed_eff) - correct
+
+    minutes = elapsed_sec / 60.0
+    gross_wpm = ((len(typed_eff) / 5.0) / minutes) if minutes > 0 else 0.0
+    net_wpm = ((correct / 5.0) / minutes) if minutes > 0 else 0.0
+    accuracy = (correct / len(typed_eff) * 100.0) if len(typed_eff) > 0 else 0.0
+
+    return {
+        "gross_wpm": gross_wpm,
+        "net_wpm": net_wpm,
+        "accuracy": accuracy,
+        "errors": errors,
+        "progress": len(typed_eff),
+        "done": True
+    }
+
+
+def unique_name(room: Room, desired: str) -> str:
+    base = desired or "User"
+    name = base
+    i = 2
+    occupied = set(room.players.keys()) | set(room.spectators.keys())
+    if room.host_name:
+        occupied.add(room.host_name)
+    while name in occupied:
+        name = f"{base}{i}"
+        i += 1
+    return name
+
+
 async def broadcast(room: Room, payload: dict):
     dead_players = []
     dead_specs = []
 
-    # players
-    for name, p in room.players.items():
+    for n, p in room.players.items():
         try:
-            await safe_json_send(p.ws, payload)
+            await send(p.ws, payload)
         except Exception:
-            dead_players.append(name)
+            dead_players.append(n)
 
-    # spectators (including host if stored here)
-    for name, ws in room.spectators.items():
+    for n, ws in room.spectators.items():
         try:
-            await safe_json_send(ws, payload)
+            await send(ws, payload)
         except Exception:
-            dead_specs.append(name)
+            dead_specs.append(n)
 
-    # host_ws separate (optional redundancy; safe to send if exists)
     if room.host_ws is not None:
         try:
-            await safe_json_send(room.host_ws, payload)
+            await send(room.host_ws, payload)
         except Exception:
             room.host_ws = None
             room.host_name = None
 
-    for name in dead_players:
-        room.players.pop(name, None)
-    for name in dead_specs:
-        room.spectators.pop(name, None)
-
-    # If host spectator disconnected, keep room running but no host
-    # (Players can still play; you can re-join host later)
-    if room.host_name and room.host_ws is None:
-        room.host_name = None
+    for n in dead_players:
+        room.players.pop(n, None)
+    for n in dead_specs:
+        room.spectators.pop(n, None)
 
 
 def room_snapshot(room: Room) -> dict:
     scores = {}
     for name, p in room.players.items():
         scores[name] = {
+            "team": p.team,
+            "ready": p.ready,
             "progress": p.progress,
             "done": p.done,
             "gross_wpm": round(p.gross_wpm, 2),
             "net_wpm": round(p.net_wpm, 2),
             "accuracy": round(p.accuracy, 1),
             "errors": p.errors,
-            "team": p.team,
-            "ready": p.ready,
         }
 
     relay = None
@@ -141,35 +183,28 @@ def room_snapshot(room: Room) -> dict:
     return {
         "type": "room",
         "room": room.room,
-        "host": room.host_name,                 # host is spectator
+        "host": room.host_name,  # host is NOT a player
         "started": room.started,
         "mode": room.mode,
         "text_len": len(room.text) if room.text else 0,
-        "scores": scores,                       # ONLY players
+        "scores": scores,  # players only
         "spectators": len(room.spectators) + (1 if room.host_ws else 0),
         "relay": relay,
+        "pool_count": len(room.text_pool),
     }
 
 
-def compute_stats(text: str, typed: str, elapsed_sec: float) -> dict:
-    if elapsed_sec <= 0:
-        elapsed_sec = 0.001
-    target = text
-    typed_eff = typed[: len(target)]
-    correct = sum(1 for i, ch in enumerate(typed_eff) if i < len(target) and ch == target[i])
-    errors = len(typed_eff) - correct
-    minutes = elapsed_sec / 60.0
-    gross_wpm = ((len(typed_eff) / 5.0) / minutes) if minutes > 0 else 0.0
-    net_wpm = ((correct / 5.0) / minutes) if minutes > 0 else 0.0
-    accuracy = (correct / len(typed_eff) * 100.0) if len(typed_eff) > 0 else 0.0
-    return {
-        "gross_wpm": gross_wpm,
-        "net_wpm": net_wpm,
-        "accuracy": accuracy,
-        "errors": errors,
-        "progress": len(typed_eff),
-        "done": True,
-    }
+def normalize_text_pool(raw: str) -> Listlines = [ln.strip() for ln in (raw or "").splitlines()]
+    lines = [ln for ln in lines if ln]
+    return lines
+
+
+def pick_text(room: Room) -> str:
+    if room.text_pool:
+        return random.choice(room.text_pool)
+    # fallback rotate defaults
+    DEFAULT_TEXTS.append(DEFAULT_TEXTS.pop(0))
+    return DEFAULT_TEXTS[0]
 
 
 def auto_assign_teams(room: Room):
@@ -184,8 +219,7 @@ def auto_assign_teams(room: Room):
         room.players[n].team = "A" if i % 2 == 0 else "B"
 
 
-def build_relay_segments(text: str, n_segments: int) -> List[str]:
-    words = text.split(" ")
+def build_relay_segments(text: str, n_segments: int) -> Listwords = text.split(" ")
     if n_segments <= 1 or len(words) <= 1:
         return [text]
     base = len(words) // n_segments
@@ -194,17 +228,18 @@ def build_relay_segments(text: str, n_segments: int) -> List[str]:
     idx = 0
     for k in range(n_segments):
         take = base + (1 if k < rem else 0)
-        segs.append(" ".join(words[idx : idx + take]))
+        segs.append(" ".join(words[idx:idx + take]))
         idx += take
     return segs
 
 
-async def start_ffa(room: Room, text: str):
+async def start_ffa(room: Room):
     room.started = True
     room.mode = "ffa"
-    room.text = text
+    room.text = pick_text(room)
     room.start_mono = now_mono()
 
+    # reset players
     for p in room.players.values():
         p.ready = False
         p.progress = 0
@@ -216,10 +251,10 @@ async def start_ffa(room: Room, text: str):
     await broadcast(room, {"type": "round", "mode": "ffa", "text": room.text})
 
 
-async def start_relay(room: Room, text: str):
+async def start_relay(room: Room):
     room.started = True
     room.mode = "relay"
-    room.text = text
+    room.text = pick_text(room)
     room.start_mono = now_mono()
 
     for p in room.players.values():
@@ -230,14 +265,14 @@ async def start_relay(room: Room, text: str):
         p.errors = 0
 
     auto_assign_teams(room)
-    room.relay_teams = {}
 
+    room.relay_teams = {}
     for name, p in room.players.items():
         tname = p.team or "A"
         room.relay_teams.setdefault(tname, RelayTeamState(name=tname)).members.append(name)
 
     for tname, t in room.relay_teams.items():
-        t.segments = build_relay_segments(text, max(1, len(t.members)))
+        t.segments = build_relay_segments(room.text, max(1, len(t.members)))
         t.runner_idx = 0
         t.segment_progress = 0
         t.finished = False
@@ -246,14 +281,14 @@ async def start_relay(room: Room, text: str):
 
     await broadcast(room, room_snapshot(room))
 
-    # Send initial segment only to runners
+    # Send first segment only to each team's runner; others wait
     for tname, t in room.relay_teams.items():
         if not t.members:
             continue
         runner = t.members[0]
         for member in t.members:
             if member == runner:
-                await safe_json_send(room.players[member].ws, {
+                await send(room.players[member].ws, {
                     "type": "relay_segment",
                     "team": tname,
                     "runner": member,
@@ -262,7 +297,7 @@ async def start_relay(room: Room, text: str):
                     "text": t.segments[0]
                 })
             else:
-                await safe_json_send(room.players[member].ws, {
+                await send(room.players[member].ws, {
                     "type": "relay_wait",
                     "team": tname,
                     "runner": runner
@@ -287,9 +322,10 @@ async def advance_relay(room: Room, team_name: str):
 
     runner = t.members[t.runner_idx]
     await broadcast(room, room_snapshot(room))
+
     for member in t.members:
         if member == runner:
-            await safe_json_send(room.players[member].ws, {
+            await send(room.players[member].ws, {
                 "type": "relay_segment",
                 "team": team_name,
                 "runner": runner,
@@ -298,51 +334,55 @@ async def advance_relay(room: Room, team_name: str):
                 "text": t.segments[t.runner_idx]
             })
         else:
-            await safe_json_send(room.players[member].ws, {
+            await send(room.players[member].ws, {
                 "type": "relay_wait",
                 "team": team_name,
                 "runner": runner
             })
 
 
-# -------------------------
-# Client HTML (adds Spectator checkbox)
-# -------------------------
-CLIENT_HTML = """<!doctype html>
+# -----------------------------
+# Client (single-page UI)
+# -----------------------------
+CLIENT_HTML = r"""<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Multiplayer Typing</title>
+  <title>Typing Game</title>
   <style>
-    body { font-family: Segoe UI, Arial; max-width: 980px; margin: 24px auto; }
+    body { font-family: Segoe UI, Arial; max-width: 1020px; margin: 24px auto; }
     .card { padding: 12px; border: 1px solid #ddd; border-radius: 10px; margin-top: 12px; }
     .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
     input, select { padding: 6px; }
-    button { padding: 8px 12px; margin-right: 8px; }
+    button { padding: 8px 12px; }
     .muted { color:#666; }
-    #promptRender { font-family: Consolas, "Courier New", monospace; white-space: pre-wrap; line-height: 1.55; }
+    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; background:#f3f4f6; }
+    textarea { width: 100%; font-size: 15px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+
+    /* prompt highlighting */
+    #promptRender { font-family: Consolas, "Courier New", monospace; white-space: pre-wrap; line-height: 1.6; }
     .ch { padding: 0 0.2px; border-radius: 3px; }
     .ok { background: #e8f7ea; color: #1a7f2e; }
     .bad { background: #fde7e9; color: #b42318; }
     .cur { outline: 2px solid #2563eb; outline-offset: 1px; }
     .rest { color: #111; }
     .dim { color: #888; }
-    textarea { width: 100%; font-size: 16px; padding: 10px; border-radius: 8px; border: 1px solid #ccc; }
+
     table { width:100%; border-collapse: collapse; }
     th, td { border-bottom: 1px solid #eee; padding: 8px; text-align:left; }
     progress { width: 160px; }
-    .pill { display:inline-block; padding:2px 8px; border-radius: 999px; background:#f3f4f6; }
     .warn { color:#b45309; }
   </style>
 </head>
 <body>
-  <h2>Multiplayer Typing </h2>
+  <h2>Multiplayer Typing (Host / Player / Spectator)</h2>
 
   <div class="card">
     <div class="row">
-      <label>Name <input id="name" value="Host"></label>
+      <label>Name <input id="name" value="Andy"></label>
       <label>Room <input id="room" value="soa-recon"></label>
-      <label>Team
+
+      <label>Team (players only)
         <select id="team">
           <option value="">Auto</option>
           <option value="A">A</option>
@@ -350,24 +390,40 @@ CLIENT_HTML = """<!doctype html>
           <option value="C">C</option>
         </select>
       </label>
+    </div>
 
-      <label class="pill">
-        <input type="checkbox" id="isSpectator" checked>
-        Spectator (Host)
-      </label>
+    <div class="row" style="margin-top:10px">
+      <span class="pill">Role:</span>
+      <label><input type="radio" name="role" value="host" checked> Host</label>
+      <label><input type="radio" name="role" value="player"> Player</label>
+      <label><input type="radio" name="role" value="spectator"> Spectator</label>
 
       <button id="joinBtn" onclick="join()">Join</button>
-      <button id="readyBtn" onclick="toggleReady()" disabled>Ready</button>
-      <button id="startFfaBtn" onclick="startRound('ffa')" disabled>Start FFA</button>
-      <button id="startRelayBtn" onclick="startRound('relay')" disabled>Start Relay</button>
-
       <span class="muted" id="status">Not connected</span>
     </div>
-    <div class="row" style="margin-top:8px">
+
+    <div class="row" style="margin-top:10px">
       <span class="pill" id="readyCount">Ready: 0/0</span>
       <span class="pill" id="modePill">Mode: -</span>
       <span class="pill" id="specCount">Spectators: 0</span>
       <span class="muted" id="hostInfo"></span>
+    </div>
+
+    <div id="hostControls" class="card" style="display:none; margin-top:12px">
+      <h3 style="margin:0 0 8px 0">Host Controls</h3>
+      <div class="muted">Paste 1 paragraph OR multiple lines (server will randomly pick 1 line each round).</div>
+      <textarea id="hostText" rows="4" placeholder="Paste typing paragraphs here, one per line..."></textarea>
+      <div class="row" style="margin-top:10px">
+        <button id="applyTextBtn" onclick="applyTextPool()">Save Text List</button>
+        <button id="startFfaBtn" onclick="startRound('ffa')">Start FFA (Type for all)</button>
+        <button id="startRelayBtn" onclick="startRound('relay')">Start Relay (Team relay)</button>
+        <span class="muted" id="poolInfo"></span>
+      </div>
+    </div>
+
+    <div id="playerControls" class="row" style="display:none; margin-top:12px">
+      <button id="readyBtn" onclick="toggleReady()">Ready</button>
+      <span class="muted">Players click Ready, then wait for Host to start.</span>
     </div>
   </div>
 
@@ -375,7 +431,7 @@ CLIENT_HTML = """<!doctype html>
     <h3>Prompt</h3>
     <div id="promptMeta" class="muted"></div>
     <div id="promptRender" class="card"></div>
-    <p class="muted">Wrong characters are highlighted in red; typing continues.</p>
+    <p class="muted">You can keep typing even if wrong — wrong characters are highlighted in red.</p>
     <textarea id="input" rows="3" placeholder="Type here..." disabled></textarea>
     <div class="row">
       <button id="finishBtn" onclick="finish()" disabled>Finish</button>
@@ -407,17 +463,36 @@ CLIENT_HTML = """<!doctype html>
 <script>
 let ws;
 let you = null;
-let yourRole = "player"; // "player" or "spectator"
-let roomState = { host:null, started:false, mode:null, text_len:0, scores:{}, spectators:0, relay:null };
+let yourRole = null; // host / player / spectator
+
+let roomState = { host:null, started:false, mode:null, text_len:0, scores:{}, spectators:0, relay:null, pool_count:0 };
 let round = { mode:null, text:"", startAt:0 };
 
 function setStatus(t){ document.getElementById("status").innerText = t; }
 function setModePill(){ document.getElementById("modePill").innerText = "Mode: " + (roomState.mode || "-"); }
 function setSpecCount(){ document.getElementById("specCount").innerText = "Spectators: " + (roomState.spectators || 0); }
+function setPoolInfo(){ document.getElementById("poolInfo").innerText = "Saved lines: " + (roomState.pool_count || 0); }
 
-function serverWsUrl(){
+function wsUrl(){
   const proto = (location.protocol === "https:") ? "wss" : "ws";
   return `${proto}://${location.host}/ws`;
+}
+
+function lockRoleUI(){
+  document.querySelectorAll('input[name="role"]').forEach(x => x.disabled = true);
+  document.getElementById("joinBtn").disabled = true;
+}
+
+function showRolePanels(){
+  document.getElementById("hostControls").style.display = (yourRole === "host") ? "block" : "none";
+  document.getElementById("playerControls").style.display = (yourRole === "player") ? "flex" : "none";
+  // spectators see no controls
+}
+
+function setTypingEnabled(on){
+  document.getElementById("input").disabled = !on;
+  document.getElementById("finishBtn").disabled = !on;
+  if (on) setTimeout(()=>document.getElementById("input").focus(), 50);
 }
 
 function renderReadyCount(){
@@ -437,7 +512,6 @@ function renderBoard(){
     if ((B.net_wpm||0)!==(A.net_wpm||0)) return (B.net_wpm||0)-(A.net_wpm||0);
     return (B.progress||0)-(A.progress||0);
   });
-
   for(const [name,s] of entries){
     const pct = roomState.text_len ? Math.min(100, Math.round((s.progress||0)/roomState.text_len*100)) : 0;
     const tr = document.createElement("tr");
@@ -458,13 +532,10 @@ function renderBoard(){
   renderReadyCount();
   setModePill();
   setSpecCount();
-
-  const isHost = (you && roomState.host && you === roomState.host);
-  document.getElementById("startFfaBtn").disabled = !isHost;
-  document.getElementById("startRelayBtn").disabled = !isHost;
+  setPoolInfo();
 
   document.getElementById("hostInfo").innerText =
-    isHost ? "You are host (spectator)." : (roomState.host ? `Host: ${roomState.host}` : "");
+    roomState.host ? ("Host: " + roomState.host) : "Host: -";
 }
 
 function renderRelay(){
@@ -514,55 +585,45 @@ function renderPrompt(target, typed){
   el.innerHTML = html;
 }
 
-function setTypingEnabled(on){
-  document.getElementById("input").disabled = !on;
-  document.getElementById("finishBtn").disabled = !on;
-  if (on) setTimeout(()=>document.getElementById("input").focus(), 50);
-}
-
 function join(){
-  const url = serverWsUrl();
-  ws = new WebSocket(url);
+  const role = document.querySelector('input[name="role"]:checked').value;
+  yourRole = role;
 
+  ws = new WebSocket(wsUrl());
   ws.onopen = () => {
     you = document.getElementById("name").value.trim() || "User";
     const room = document.getElementById("room").value.trim() || "default";
-    const team = document.getElementById("team").value.trim();
-    yourRole = document.getElementById("isSpectator").checked ? "spectator" : "player";
+    const team = document.getElementById("team").value.trim(); // players only
 
-    ws.send(JSON.stringify({action:"join", name:you, room:room, team:team, role:yourRole}));
+    ws.send(JSON.stringify({action:"join", name:you, room:room, team:team, role:role}));
     setStatus("Connected");
   };
 
   ws.onmessage = (ev) => {
     const msg = JSON.parse(ev.data);
 
-    if(msg.type === "joined"){
+    if (msg.type === "joined"){
       you = msg.you;
+      lockRoleUI();
+      showRolePanels();
       document.getElementById("promptCard").style.display = "block";
-
-      // Spectator cannot Ready or type
-      document.getElementById("readyBtn").disabled = (yourRole !== "player");
-      if (yourRole === "spectator"){
-        setTypingEnabled(false);
-        document.getElementById("promptMeta").innerText = "Spectator view (Host).";
-      }
       setStatus(`Joined room: ${msg.room} as ${yourRole}`);
+      if (yourRole !== "player") setTypingEnabled(false);
     }
 
-    if(msg.type === "room"){
+    if (msg.type === "room"){
       roomState = msg;
       renderBoard();
       renderRelay();
     }
 
-    // Players receive round events; spectators also receive them but won't type
-    if(msg.type === "round"){
+    if (msg.type === "round"){
       round.mode = msg.mode;
       round.text = msg.text;
       round.startAt = Date.now();
 
-      document.getElementById("promptMeta").innerText = "FFA: Everyone types the full text.";
+      document.getElementById("promptMeta").innerText =
+        (msg.mode === "ffa") ? "FFA: Everyone types the full text." : "Relay round started.";
       document.getElementById("input").value = "";
       renderPrompt(round.text, "");
 
@@ -571,16 +632,16 @@ function join(){
       } else {
         setTypingEnabled(false);
       }
-      setStatus("FFA started!");
+      setStatus("Round started!");
     }
 
-    if(msg.type === "relay_segment"){
+    if (msg.type === "relay_segment"){
       round.mode = "relay";
       round.text = msg.text;
       round.startAt = Date.now();
 
       document.getElementById("promptMeta").innerText =
-        `Relay: Team ${msg.team} | ${yourRole === "player" ? "Your turn" : "Spectator view"} (${msg.segment_index+1}/${msg.segment_total})`;
+        `Relay: Team ${msg.team} | ${(yourRole === "player") ? "Your turn" : "Spectator/Host view"} (${msg.segment_index+1}/${msg.segment_total})`;
       document.getElementById("input").value = "";
       renderPrompt(round.text, "");
 
@@ -592,7 +653,7 @@ function join(){
       setStatus("Relay segment started!");
     }
 
-    if(msg.type === "relay_wait"){
+    if (msg.type === "relay_wait"){
       round.mode = "relay";
       document.getElementById("promptMeta").innerText =
         `Relay: Team ${msg.team} | Waiting... Current runner: ${msg.runner}`;
@@ -602,12 +663,17 @@ function join(){
       setStatus("Waiting...");
     }
 
-    if(msg.type === "relay_finished"){
+    if (msg.type === "relay_finished"){
       setTypingEnabled(false);
       setStatus("Relay finished ✅");
     }
 
-    if(msg.type === "error"){
+    if (msg.type === "ffa_finished"){
+      setTypingEnabled(false);
+      setStatus("FFA finished ✅");
+    }
+
+    if (msg.type === "error"){
       alert(msg.message);
     }
   };
@@ -615,12 +681,21 @@ function join(){
   ws.onclose = () => setStatus("Disconnected");
 }
 
-function toggleReady(){
-  ws.send(JSON.stringify({action:"ready"}));
+function applyTextPool(){
+  if (yourRole !== "host") return;
+  const raw = document.getElementById("hostText").value || "";
+  ws.send(JSON.stringify({action:"set_texts", raw: raw}));
 }
 
 function startRound(mode){
-  ws.send(JSON.stringify({action:"start", mode:mode}));
+  if (yourRole !== "host") return;
+  const raw = document.getElementById("hostText").value || "";
+  ws.send(JSON.stringify({action:"start", mode: mode, raw: raw}));
+}
+
+function toggleReady(){
+  if (yourRole !== "player") return;
+  ws.send(JSON.stringify({action:"ready"}));
 }
 
 let lastProgSent = 0;
@@ -632,7 +707,7 @@ function sendProgress(p){
 }
 
 document.getElementById("input").addEventListener("input", (e)=>{
-  if (yourRole !== "player") return; // spectators never type
+  if (yourRole !== "player") return;
 
   const typed = e.target.value;
   renderPrompt(round.text, typed);
@@ -644,6 +719,11 @@ document.getElementById("input").addEventListener("input", (e)=>{
   document.getElementById("errs").innerText = s.errors;
 
   sendProgress(s.progress);
+
+  // Relay: auto-finish segment when completed
+  if (round.mode === "relay" && s.progress >= (round.text || "").length){
+    finish();
+  }
 });
 
 function finish(){
@@ -658,18 +738,22 @@ function finish(){
 </html>
 """
 
+
 @app.get("/")
 def home():
     return HTMLResponse(CLIENT_HTML)
 
 
+# -----------------------------
+# WebSocket Endpoint
+# -----------------------------
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
 
     room: Optional[Room] = None
     name: Optional[str] = None
-    role: str = "player"
+    role: str = "spectator"
 
     try:
         while True:
@@ -679,69 +763,79 @@ async def ws_endpoint(ws: WebSocket):
 
             if action == "join":
                 room_name = (msg.get("room") or "default").strip()
-                name = (msg.get("name") or "User").strip()
+                desired = (msg.get("name") or "User").strip()
+                role = (msg.get("role") or "spectator").strip().lower()
                 team = (msg.get("team") or "").strip() or None
-                role = (msg.get("role") or "player").strip().lower()
 
                 room = rooms.get(room_name)
                 if not room:
                     room = Room(room=room_name)
                     rooms[room_name] = room
 
-                # unique name among BOTH players & spectators & host
-                base = name
-                i = 2
-                occupied = set(room.players.keys()) | set(room.spectators.keys())
-                if room.host_name:
-                    occupied.add(room.host_name)
+                name = unique_name(room, desired)
 
-                while name in occupied:
-                    name = f"{base}{i}"
-                    i += 1
-
-                if role == "spectator":
-                    # If no host yet, first spectator becomes host
+                if role == "host":
+                    # only one host; if already exists, downgrade to spectator
                     if room.host_name is None:
                         room.host_name = name
                         room.host_ws = ws
                     else:
+                        role = "spectator"
                         room.spectators[name] = ws
-                else:
+                        await send(ws, {"type":"error", "message":"Host already exists in this room. Joined as spectator instead."})
+                elif role == "player":
                     room.players[name] = Player(name=name, ws=ws, team=team)
+                else:
+                    role = "spectator"
+                    room.spectators[name] = ws
 
-                await safe_json_send(ws, {"type": "joined", "you": name, "room": room_name})
+                await send(ws, {"type": "joined", "you": name, "room": room_name, "role": role})
                 await broadcast(room, room_snapshot(room))
                 continue
 
             if not room or not name:
-                await safe_json_send(ws, {"type": "error", "message": "Join a room first."})
+                await send(ws, {"type": "error", "message": "Join a room first."})
                 continue
 
-            # host check (host is spectator)
             is_host = (room.host_name == name) and (room.host_ws == ws)
+            is_player = (name in room.players)
 
+            # Host-only: save text list
+            if action == "set_texts":
+                if not is_host:
+                    await send(ws, {"type":"error", "message":"Only Host can set text list."})
+                    continue
+                raw = (msg.get("raw") or "")
+                pool = normalize_text_pool(raw)
+                room.text_pool = pool
+                await broadcast(room, room_snapshot(room))
+                continue
+
+            # Host-only: start game
             if action == "start":
                 if not is_host:
-                    await safe_json_send(ws, {"type": "error", "message": "Only host (spectator) can start."})
+                    await send(ws, {"type":"error", "message":"Only Host can start a game."})
                     continue
 
+                raw = (msg.get("raw") or "")
+                pool = normalize_text_pool(raw)
+                # if host provided content, save it
+                if pool:
+                    room.text_pool = pool
+
                 mode = (msg.get("mode") or "ffa").lower()
-                if not room.text:
-                    DEFAULT_TEXTS.append(DEFAULT_TEXTS.pop(0))
-                    room.text = DEFAULT_TEXTS[0]
 
                 if mode == "ffa":
-                    await start_ffa(room, room.text)
+                    await start_ffa(room)
                 elif mode == "relay":
-                    await start_relay(room, room.text)
+                    await start_relay(room)
                 else:
-                    await safe_json_send(ws, {"type": "error", "message": "Unknown mode."})
+                    await send(ws, {"type":"error", "message":"Unknown mode."})
                 continue
 
-            # The rest are PLAYER-only actions
-            if name not in room.players:
-                # spectators/host cannot ready/progress/finish
-                await safe_json_send(ws, {"type": "error", "message": "Spectators cannot perform this action."})
+            # Player-only actions below
+            if not is_player:
+                await send(ws, {"type":"error", "message":"This action is for players only."})
                 continue
 
             player = room.players[name]
@@ -755,6 +849,7 @@ async def ws_endpoint(ws: WebSocket):
                 player.progress = max(0, prog)
                 await broadcast(room, room_snapshot(room))
 
+                # relay progress: only runner matters
                 if room.mode == "relay" and room.started:
                     team_name = player.team or "A"
                     if team_name in room.relay_teams:
@@ -768,19 +863,22 @@ async def ws_endpoint(ws: WebSocket):
 
             elif action == "finish":
                 typed = msg.get("typed") or ""
+
                 if room.mode == "ffa" and room.started:
                     elapsed = now_mono() - room.start_mono
                     stats = compute_stats(room.text, typed, elapsed)
+
                     player.progress = stats["progress"]
                     player.done = True
                     player.gross_wpm = stats["gross_wpm"]
                     player.net_wpm = stats["net_wpm"]
                     player.accuracy = stats["accuracy"]
                     player.errors = stats["errors"]
+
                     await broadcast(room, room_snapshot(room))
                     if all(p.done for p in room.players.values()):
                         room.started = False
-                        await broadcast(room, {"type": "ffa_finished"})
+                        await broadcast(room, {"type":"ffa_finished"})
 
                 elif room.mode == "relay" and room.started:
                     team_name = player.team or "A"
@@ -794,6 +892,7 @@ async def ws_endpoint(ws: WebSocket):
                     elapsed = now_mono() - room.start_mono
                     seg_text = t.segments[t.runner_idx]
                     stats = compute_stats(seg_text, typed, elapsed)
+
                     player.done = True
                     player.gross_wpm = stats["gross_wpm"]
                     player.net_wpm = stats["net_wpm"]
@@ -805,16 +904,26 @@ async def ws_endpoint(ws: WebSocket):
                     await advance_relay(room, team_name)
 
             else:
-                await safe_json_send(ws, {"type": "error", "message": "Unknown action."})
+                await send(ws, {"type":"error", "message":"Unknown action."})
 
     except WebSocketDisconnect:
         pass
     finally:
-        # cleanup on disconnect
+        # Cleanup
         if room and name:
             if room.host_name == name and room.host_ws == ws:
-                room.host_ws = None
                 room.host_name = None
+                room.host_ws = None
             room.players.pop(name, None)
             room.spectators.pop(name, None)
             await broadcast(room, room_snapshot(room))
+
+
+# -----------------------------
+# Render-friendly start tips
+# -----------------------------
+# Render Start Command suggestion:
+#   uvicorn main:app --host 0.0.0.0 --port $PORT
+#
+# Local run:
+#   uvicorn main:app --host 0.0.0.0 --port 8000 --reload
