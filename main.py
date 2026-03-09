@@ -3,14 +3,14 @@ import json
 import random
 import time
 from dataclasses import dataclass, field
-from typing import Dict, Set, Optional
+from typing import Dict, Set, Optional, List, Tuple
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 
 app = FastAPI()
 
-# Fallback texts (used only when host doesn't set a custom text)
+# Fallback texts (used only when host doesn't set pool or single text)
 TEXTS = [
     "SOA reconciliation improves completeness and reduces operational risk.",
     "Automation helps track SOA tickets even when some were not downloaded.",
@@ -20,41 +20,37 @@ TEXTS = [
 
 DEFAULT_COUNTDOWN = 5  # seconds
 
-# ------------------- Game State -------------------
-@dataclass
-class PlayerState:
-    name: str
-    ready: bool = False
-    progress: int = 0
-    done: bool = False
-    gross_wpm: float = 0.0
-    net_wpm: float = 0.0
-    accuracy: float = 0.0
 
-@dataclass
-class RoomState:
-    clients: Set[WebSocket] = field(default_factory=set)
-    players_by_ws: Dict[WebSocket, str] = field(default_factory=dict)
-    players: Dict[str, PlayerState] = field(default_factory=dict)
-
-    host: Optional[str] = None
-
-    # text_override: if set, always use this text for new rounds until cleared
-    text_override: str = ""
-
-    # current round text
-    text: str = ""
-    start_time: float = 0.0
-    started: bool = False
-
-    countdown_task: Optional[asyncio.Task] = None
-    countdown_active: bool = False
-    countdown_remaining: int = 0
-
-rooms: Dict[str, RoomState] = {}
+# ------------------- Helpers -------------------
+def parse_paragraphs(raw: str) -> List[str]:
+    """
+    Split a pasted list into paragraphs by blank lines.
+    Also supports lines containing only --- as separators.
+    """
+    raw = (raw or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not raw:
+        return []
+    raw = raw.replace("\n---\n", "\n\n")
+    parts = [p.strip() for p in raw.split("\n\n") if p.strip()]
+    return [p for p in parts if len(p) >= 10]
 
 
-def compute_metrics(prompt: str, typed: str, elapsed_sec: float):
+def correct_prefix_len(prompt: str, typed: str) -> int:
+    """Number of characters matching prompt from start (TypeRacer-like)."""
+    m = min(len(prompt), len(typed))
+    i = 0
+    while i < m and prompt[i] == typed[i]:
+        i += 1
+    return i
+
+
+def compute_final_metrics(prompt: str, typed: str, elapsed_sec: float):
+    """
+    Simple final scoring:
+    - Gross WPM: (chars/5)/minutes
+    - Net WPM: gross - (errors/minute)
+    - Accuracy: correct/prompt_len
+    """
     minutes = max(elapsed_sec / 60.0, 1e-9)
 
     correct = 0
@@ -64,7 +60,6 @@ def compute_metrics(prompt: str, typed: str, elapsed_sec: float):
             correct += 1
         else:
             mismatches += 1
-
     length_diff = abs(len(prompt) - len(typed))
     errors = mismatches + length_diff
 
@@ -75,8 +70,66 @@ def compute_metrics(prompt: str, typed: str, elapsed_sec: float):
     return round(gross_wpm, 1), round(net_wpm, 1), round(accuracy, 1)
 
 
+# ------------------- Game State -------------------
+@dataclass
+class PlayerState:
+    name: str
+    ready: bool = False
+
+    # TypeRacer progress: correct prefix length
+    progress: int = 0
+    done: bool = False
+
+    # live metrics
+    wpm_live: float = 0.0
+
+    # final metrics after finish
+    gross_wpm: float = 0.0
+    net_wpm: float = 0.0
+    accuracy: float = 0.0
+
+    # finish time for podium
+    finish_time: Optional[float] = None  # seconds since round start
+
+
+@dataclass
+class RoomState:
+    clients: Set[WebSocket] = field(default_factory=set)
+    players_by_ws: Dict[WebSocket, str] = field(default_factory=dict)
+    players: Dict[str, PlayerState] = field(default_factory=dict)
+
+    host: Optional[str] = None
+
+    # Single custom text (host)
+    text_override: str = ""
+
+    # Multi-paragraph pool (host pasted list)
+    text_pool: List[str] = field(default_factory=list)
+    # No-repeat bag drawn from pool (shuffled)
+    text_bag: List[str] = field(default_factory=list)
+
+    # Current round text
+    text: str = ""
+    start_time: float = 0.0
+    started: bool = False
+
+    countdown_task: Optional[asyncio.Task] = None
+    countdown_active: bool = False
+    countdown_remaining: int = 0
+
+    # Whether we already broadcast podium for this round
+    podium_broadcasted: bool = False
+
+
+rooms: Dict[str, RoomState] = {}
+
+
 def connected_player_names(room: RoomState) -> Set[str]:
     return set(room.players_by_ws.values())
+
+
+def connected_count(room: RoomState) -> int:
+    return len(connected_player_names(room))
 
 
 def ready_count(room: RoomState) -> int:
@@ -84,13 +137,16 @@ def ready_count(room: RoomState) -> int:
     return sum(1 for n in connected if room.players.get(n) and room.players[n].ready)
 
 
-def connected_count(room: RoomState) -> int:
-    return len(connected_player_names(room))
-
-
 def all_connected_ready(room: RoomState) -> bool:
     cc = connected_count(room)
     return cc > 0 and ready_count(room) == cc
+
+
+def compute_podium(room: RoomState) -> List[Tuple[str, PlayerState]]:
+    """Return top-3 based on finish_time (fastest wins)."""
+    finished = [(name, ps) for name, ps in room.players.items() if ps.done and ps.finish_time is not None]
+    finished.sort(key=lambda x: x[1].finish_time)  # ascending time
+    return finished[:3]
 
 
 def snapshot(room: RoomState):
@@ -103,14 +159,18 @@ def snapshot(room: RoomState):
         "connected_count": connected_count(room),
         "ready_count": ready_count(room),
         "has_custom_text": bool(room.text_override.strip()),
+        "pool_size": len(room.text_pool),
+        "using_pool": bool(room.text_pool),
         "scores": {
             name: {
                 "ready": ps.ready,
                 "progress": ps.progress,
                 "done": ps.done,
+                "wpm_live": ps.wpm_live,
                 "gross_wpm": ps.gross_wpm,
                 "net_wpm": ps.net_wpm,
                 "accuracy": ps.accuracy,
+                "finish_time": ps.finish_time,
             } for name, ps in room.players.items()
         }
     }
@@ -132,6 +192,18 @@ async def broadcast(room_id: str, payload: dict):
         room.players_by_ws.pop(ws, None)
 
 
+def pick_round_text(room: RoomState) -> str:
+    # Priority: pool -> single override -> fallback list
+    if room.text_pool:
+        if not room.text_bag:
+            room.text_bag = room.text_pool.copy()
+            random.shuffle(room.text_bag)
+        return room.text_bag.pop()
+    if room.text_override.strip():
+        return room.text_override.strip()
+    return random.choice(TEXTS)
+
+
 async def run_countdown_then_start(room_id: str, seconds: int):
     room = rooms.get(room_id)
     if not room:
@@ -151,27 +223,24 @@ async def run_countdown_then_start(room_id: str, seconds: int):
             await broadcast(room_id, {"type": "room", **snapshot(room)})
             await asyncio.sleep(1)
 
-        # Start the round
         room = rooms.get(room_id)
         if not room:
             return
 
-        # Use custom text if provided; otherwise fallback to random
-        if room.text_override.strip():
-            room.text = room.text_override.strip()
-        else:
-            room.text = random.choice(TEXTS)
-
+        room.text = pick_round_text(room)
         room.started = True
         room.start_time = time.time()
         room.countdown_active = False
         room.countdown_remaining = 0
+        room.podium_broadcasted = False
 
-        # Reset round stats and reset ready to require Ready again next round
+        # Reset per-round stats and require Ready again
         for ps in room.players.values():
             ps.progress = 0
             ps.done = False
+            ps.wpm_live = 0.0
             ps.gross_wpm = ps.net_wpm = ps.accuracy = 0.0
+            ps.finish_time = None
             ps.ready = False
 
         await broadcast(room_id, {"type": "round", "text": room.text})
@@ -186,40 +255,59 @@ async def run_countdown_then_start(room_id: str, seconds: int):
             await broadcast(room_id, {"type": "room", **snapshot(room)})
 
 
-# ------------------- One-URL Web Page -------------------
-HTML = """
+# ------------------- One-URL Web Page (TypeRacer-like) -------------------
+HTML = r"""
 <!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Multiplayer Typing Game</title>
+  <title>Typing Race</title>
   <style>
-    body { font-family: Segoe UI, Arial; max-width: 980px; margin: 24px auto; }
-    .card { padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-top: 12px; }
-    #prompt { background: #f5f5f5; white-space: pre-wrap; }
-    textarea { width: 100%; font-size: 16px; padding: 10px; }
-    button { padding: 8px 12px; margin-right: 8px; }
-    .muted { color:#666; }
+    body { font-family: Segoe UI, Arial; max-width: 1100px; margin: 24px auto; }
+    .card { padding: 12px; border: 1px solid #ddd; border-radius: 12px; margin-top: 12px; }
     .row { display:flex; gap:12px; flex-wrap: wrap; align-items:center; }
-    input { padding: 6px; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { border-bottom: 1px solid #eee; padding: 8px; text-align:left; }
-    progress { width: 180px; }
-    .badge { display:inline-block; padding:2px 8px; border-radius: 999px; font-size: 12px; }
+    input, textarea { padding: 8px; font-size: 14px; }
+    textarea { width: 100%; font-size: 16px; padding: 10px; }
+    button { padding: 8px 12px; }
+    .muted { color:#666; }
+    .right { margin-left:auto; }
+    .countdown { font-weight:700; font-size: 18px; }
+    .badge { display:inline-block; padding:2px 8px; border-radius: 999px; font-size: 12px; margin-left:6px;}
     .badge-ready { background:#e8fff0; color:#0b6b2a; border:1px solid #b7f0c9; }
     .badge-notready { background:#fff3f3; color:#8a1f1f; border:1px solid #ffd0d0; }
-    .countdown { font-weight:700; font-size: 18px; }
-    .right { margin-left:auto; }
+
+    /* prompt highlighting */
+    #promptBox { font-size: 18px; line-height: 1.35; background:#f6f6f6; }
+    .ok { color: #0b6b2a; }
+    .next { text-decoration: underline; text-decoration-thickness: 3px; }
+    .rest { color: #444; }
+
+    /* racetrack */
+    .track { position: relative; height: 30px; background: #f0f3ff; border: 1px solid #d6dcff; border-radius: 999px; overflow: hidden; }
+    .car { position: absolute; top: 3px; left: 0%; transition: left 0.08s linear; }
+    .lane { display:flex; gap:10px; align-items:center; margin: 8px 0; }
+    .laneName { width: 220px; overflow:hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .laneStats { width: 280px; text-align:right; }
+
+    #input { border: 2px solid #ddd; border-radius: 10px; }
+    #input.bad { border-color: #d33; background: #fff3f3; }
+
+    /* podium overlay */
+    #podiumOverlay { display:none; position:fixed; inset:0; background:rgba(0,0,0,.55); z-index:9999; }
+    #podiumCard { max-width:560px; margin:10vh auto; background:#fff; border-radius:16px; padding:18px; }
+    #podiumList { font-size:16px; line-height:1.7; }
+    #confetti { position:fixed; inset:0; pointer-events:none; }
   </style>
 </head>
 <body>
-  <h2>Multiplayer Typing Game (Custom Text + Ready Count)</h2>
+  <h2>Typing Race (TypeRacer‑style)</h2>
 
   <div class="card">
     <div class="row">
       <label>Name <input id="name" value="Andy"></label>
       <label>Room <input id="room" value="Typing"></label>
       <button onclick="join()">Join</button>
+
       <button id="readyBtn" onclick="toggleReady()" disabled>Ready ✅</button>
       <button id="startBtn" onclick="startCountdown()" disabled>Start Countdown (Host)</button>
 
@@ -228,97 +316,180 @@ HTML = """
 
       <span class="right muted" id="readyCount">Ready: 0/0</span>
     </div>
-    <div class="muted">Share this link to others: <b>http://HOST_IP:8000</b></div>
+    <div class="muted">Share this same URL to others (Render URL / LAN URL).</div>
   </div>
 
   <div class="card" id="hostPanel" style="display:none;">
-    <h3>Host Controls (Change typing text without editing code)</h3>
-    <div class="muted">
-      Paste any text below. It will be used for the <b>next round</b> (and stays until you clear it).
-    </div>
-    <textarea id="customText" rows="4" placeholder="Paste your paragraph here..."></textarea>
+    <h3>Host Controls</h3>
+
+    <div class="muted">Single text (used every round unless paragraph bank is set):</div>
+    <textarea id="customText" rows="3" placeholder="Paste single paragraph here..."></textarea>
     <div class="row">
-      <button onclick="updateText()">Update Text</button>
-      <button onclick="clearText()">Clear Custom Text</button>
-      <span class="muted" id="textMode">Mode: Random</span>
+      <button onclick="updateText()">Update Single Text</button>
+      <button onclick="clearText()">Clear Single Text</button>
+      <span class="muted" id="textMode">Mode: Random fallback</span>
+    </div>
+
+    <hr style="border:none;border-top:1px solid #eee; margin:14px 0;">
+
+    <h4>Paragraph Bank (Random each round, no-repeat until exhausted)</h4>
+    <div class="muted">Paste multiple paragraphs separated by a blank line. Each round picks one randomly.</div>
+    <textarea id="textList" rows="8" placeholder="Paragraph 1...
+
+Paragraph 2...
+
+Paragraph 3..."></textarea>
+    <div class="row">
+      <button onclick="updatePool()">Update Paragraph Bank</button>
+      <button onclick="clearPool()">Clear Paragraph Bank</button>
+      <span class="muted" id="poolInfo">Pool: 0</span>
     </div>
   </div>
 
-  <div class="card" id="promptCard" style="display:none;">
+  <div class="card" id="racePanel" style="display:none;">
     <h3>Prompt</h3>
-    <div id="prompt" class="card"></div>
-    <p class="muted">Wait for countdown → type → click Finish.</p>
-    <textarea id="input" rows="3" placeholder="Type here..." disabled></textarea>
-    <div class="row">
-      <button id="finishBtn" onclick="finish()" disabled>Finish</button>
-      <span class="muted" id="hostInfo"></span>
-    </div>
+    <div id="promptBox" class="card"></div>
+    <div class="muted">Type until the end. Wrong character is rejected (TypeRacer-style).</div>
+    <textarea id="input" rows="2" placeholder="Type here..." disabled></textarea>
   </div>
 
   <div class="card">
-    <h3>Leaderboard</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Player</th>
-          <th>Ready</th>
-          <th>Progress</th>
-          <th>Gross WPM</th>
-          <th>Net WPM</th>
-          <th>Accuracy</th>
-          <th>Status</th>
-        </tr>
-      </thead>
-      <tbody id="board"></tbody>
-    </table>
+    <h3>Race Track</h3>
+    <div id="lanes"></div>
+  </div>
+
+  <div id="podiumOverlay">
+    <canvas id="confetti"></canvas>
+    <div id="podiumCard">
+      <h2 style="margin:0 0 10px;">🏆 Results</h2>
+      <div id="podiumList"></div>
+      <div class="row" style="margin-top:12px;">
+        <button onclick="closePodium()">Close</button>
+        <span class="muted">Host can start next round after everyone Ready again.</span>
+      </div>
+    </div>
   </div>
 
 <script>
 let ws;
 let you = null;
 let isReady = false;
-let state = { host:null, text_len:0, scores:{}, countdown_active:false, countdown_remaining:0,
-              ready_count:0, connected_count:0, has_custom_text:false };
+
+let promptText = "";
+let lastGood = "";          // local correct prefix string
+let podiumShown = false;
+
+let state = {
+  host: null,
+  text_len: 0,
+  scores: {},
+  ready_count: 0,
+  connected_count: 0,
+  has_custom_text: false,
+  pool_size: 0,
+  using_pool: false
+};
 
 function setStatus(t){ document.getElementById("status").innerText = t; }
 function setCountdownText(t){ document.getElementById("cd").innerText = t ? ("⏳ " + t) : ""; }
 
-function renderBoard(){
-  const tbody = document.getElementById("board");
-  tbody.innerHTML = "";
-  const entries = Object.entries(state.scores || {});
-  entries.sort((a,b)=>{
-    const A=a[1], B=b[1];
-    if ((B.done?1:0) !== (A.done?1:0)) return (B.done?1:0)-(A.done?1:0);
-    if ((B.net_wpm||0) !== (A.net_wpm||0)) return (B.net_wpm||0)-(A.net_wpm||0);
-    return (B.progress||0)-(A.progress||0);
-  });
+function escapeHtml(s){
+  return s.replaceAll("&","&amp;").replaceAll("<","&lt;").replaceAll(">","&gt;");
+}
 
-  for(const [name, s] of entries){
-    const pct = state.text_len ? Math.min(100, Math.round((s.progress||0)/state.text_len*100)) : 0;
-    const readyBadge = s.ready
-      ? '<span class="badge badge-ready">READY</span>'
-      : '<span class="badge badge-notready">NO</span>';
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${name}${name===state.host ? " 👑" : ""}</td>
-      <td>${readyBadge}</td>
-      <td><progress max="100" value="${pct}"></progress> ${pct}%</td>
-      <td>${s.gross_wpm ?? 0}</td>
-      <td>${s.net_wpm ?? 0}</td>
-      <td>${s.accuracy ?? 0}%</td>
-      <td>${s.done ? "✅ done" : "…"}</td>
-    `;
-    tbody.appendChild(tr);
-  }
+function correctPrefix(prompt, typed){
+  const m = Math.min(prompt.length, typed.length);
+  let i = 0;
+  while(i < m && prompt[i] === typed[i]) i++;
+  return i;
+}
+
+function renderPromptHighlight(){
+  const i = correctPrefix(promptText, lastGood);
+  const ok = escapeHtml(promptText.slice(0, i));
+  const nextChar = promptText[i] ?? "";
+  const next = escapeHtml(nextChar);
+  const rest = escapeHtml(promptText.slice(i + (nextChar ? 1 : 0)));
+
+  let html = "";
+  html += `<span class="ok">${ok}</span>`;
+  if(nextChar) html += `<span class="rest next">${next}</span>`;
+  html += `<span class="rest">${rest}</span>`;
+  document.getElementById("promptBox").innerHTML = html;
 }
 
 function wsUrl(){
   const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-  const host = window.location.host; // e.g. typing-game.onrender.com
+  const host = window.location.host;
   const r = encodeURIComponent(document.getElementById("room").value.trim());
   const n = encodeURIComponent(document.getElementById("name").value.trim());
   return `${protocol}://${host}/ws?room=${r}&name=${n}`;
+}
+
+function renderLanes(){
+  const lanes = document.getElementById("lanes");
+  lanes.innerHTML = "";
+  const scores = state.scores || {};
+  const names = Object.keys(scores);
+
+  // sort by progress desc; finished with time bubble up
+  names.sort((a,b)=>{
+    const A = scores[a], B = scores[b];
+    const fa = A.finish_time ?? Infinity;
+    const fb = B.finish_time ?? Infinity;
+    if(fa !== fb) return fa - fb;        // finished earlier first
+    return (B.progress||0) - (A.progress||0);
+  });
+
+  for(const name of names){
+    const s = scores[name];
+    const pct = state.text_len ? Math.min(100, Math.round((s.progress||0)/state.text_len*100)) : 0;
+    const readyBadge = s.ready
+      ? '<span class="badge badge-ready">READY</span>'
+      : '<span class="badge badge-notready">NO</span>';
+
+    const carLeft = `calc(${pct}% - 10px)`;
+    const w = (s.net_wpm ?? s.wpm_live ?? 0);
+    const ft = (s.finish_time !== null && s.finish_time !== undefined) ? ` | ${s.finish_time.toFixed(2)}s` : "";
+
+    const lane = document.createElement("div");
+    lane.className = "lane";
+    lane.innerHTML = `
+      <div class="laneName">${escapeHtml(name)}${name===state.host ? " 👑" : ""}${readyBadge}</div>
+      <div class="track" style="flex:1;">
+        <div class="car" style="left:${carLeft};">🚗</div>
+      </div>
+      <div class="laneStats">
+        ${pct}% | WPM: ${Number(w).toFixed(1)}${ft} ${s.done ? "✅" : ""}
+      </div>
+    `;
+    lanes.appendChild(lane);
+  }
+}
+
+function updateUIFromRoom(msg){
+  state.host = msg.host;
+  state.text_len = msg.text_len || 0;
+  state.scores = msg.scores || {};
+  state.ready_count = msg.ready_count || 0;
+  state.connected_count = msg.connected_count || 0;
+  state.has_custom_text = msg.has_custom_text || false;
+  state.pool_size = msg.pool_size || 0;
+  state.using_pool = msg.using_pool || false;
+
+  document.getElementById("readyCount").innerText = `Ready: ${state.ready_count}/${state.connected_count}`;
+  document.getElementById("poolInfo").innerText = `Pool: ${state.pool_size}`;
+
+  const isHost = (you && you === state.host);
+  document.getElementById("startBtn").disabled = !isHost;
+  document.getElementById("hostPanel").style.display = isHost ? "block" : "none";
+
+  let mode = "Mode: Random fallback";
+  if(state.using_pool) mode = "Mode: Paragraph Bank (Random)";
+  else if(state.has_custom_text) mode = "Mode: Single custom text";
+  document.getElementById("textMode").innerText = mode;
+
+  renderLanes();
 }
 
 function join(){
@@ -330,72 +501,58 @@ function join(){
 
     if(msg.type === "welcome"){
       you = msg.you;
-      document.getElementById("promptCard").style.display = "block";
+      document.getElementById("racePanel").style.display = "block";
       document.getElementById("readyBtn").disabled = false;
     }
 
-    if(msg.type === "room" || msg.type === "leaderboard"){
-      state.host = msg.host;
-      state.text_len = msg.text_len || 0;
-      state.scores = msg.scores || {};
-      state.countdown_active = msg.countdown_active || false;
-      state.countdown_remaining = msg.countdown_remaining || 0;
-      state.ready_count = msg.ready_count || 0;
-      state.connected_count = msg.connected_count || 0;
-      state.has_custom_text = msg.has_custom_text || false;
+    if(msg.type === "room" || msg.type === "state" || msg.type === "leaderboard"){
+      updateUIFromRoom(msg);
 
-      document.getElementById("readyCount").innerText =
-        `Ready: ${state.ready_count}/${state.connected_count}`;
-
-      const host = (you && you === state.host);
-      document.getElementById("startBtn").disabled = !host;
-      document.getElementById("hostPanel").style.display = host ? "block" : "none";
-      document.getElementById("textMode").innerText = state.has_custom_text ? "Mode: Custom text" : "Mode: Random";
-
-      document.getElementById("hostInfo").innerText =
-        host ? "You are host. Start countdown when Ready = Connected." :
-        (state.host ? `Host: ${state.host}` : "");
-
-      if(state.countdown_active && state.countdown_remaining){
-        setCountdownText(state.countdown_remaining + "s");
-      } else {
-        setCountdownText("");
+      // If server broadcasts podium, show to everyone
+      if(msg.type === "leaderboard" && msg.podium){
+        if(!podiumShown){
+          showPodium(msg.podium);
+        }
       }
-
-      renderBoard();
     }
 
     if(msg.type === "countdown"){
       setCountdownText(msg.seconds + "s");
       setStatus("Countdown...");
       document.getElementById("input").disabled = true;
-      document.getElementById("finishBtn").disabled = true;
     }
 
     if(msg.type === "round"){
       setCountdownText("");
-      document.getElementById("prompt").innerText = msg.text;
-      const inp = document.getElementById("input");
-      inp.disabled = false;
-      document.getElementById("finishBtn").disabled = false;
-      inp.value = "";
-      inp.focus();
-      setStatus("GO!");
+      promptText = msg.text;
+      lastGood = "";
+      podiumShown = false;
+      renderPromptHighlight();
 
-      // reset local ready state for next round
+      const inp = document.getElementById("input");
+      inp.value = "";
+      inp.disabled = false;
+      inp.classList.remove("bad");
+      inp.focus();
+
+      setStatus("GO!");
       isReady = false;
       document.getElementById("readyBtn").innerText = "Ready ✅";
     }
 
-    if(msg.type === "progress"){
-      if(state.scores && state.scores[msg.name]){
-        state.scores[msg.name].progress = msg.progress;
-        renderBoard();
-      }
+    if(msg.type === "pool_updated"){
+      document.getElementById("poolInfo").innerText = `Pool: ${msg.pool_size}`;
+      setStatus("Paragraph bank updated ✅");
     }
 
     if(msg.type === "text_updated"){
-      setStatus("Text updated ✅ (next round)");
+      setStatus("Single text updated ✅ (next round)");
+    }
+
+    if(msg.type === "podium"){
+      if(!podiumShown){
+        showPodium(msg.podium);
+      }
     }
 
     if(msg.type === "error"){
@@ -407,7 +564,7 @@ function join(){
 function toggleReady(){
   if(!ws) return;
   isReady = !isReady;
-  ws.send(JSON.stringify({action:"ready", ready: isReady}));
+  ws.send(JSON.stringify({action:"ready", ready:isReady}));
   document.getElementById("readyBtn").innerText = isReady ? "Unready ❌" : "Ready ✅";
 }
 
@@ -418,8 +575,7 @@ function startCountdown(){
 
 function updateText(){
   if(!ws) return;
-  const t = document.getElementById("customText").value;
-  ws.send(JSON.stringify({action:"set_text", text: t}));
+  ws.send(JSON.stringify({action:"set_text", text: document.getElementById("customText").value}));
 }
 
 function clearText(){
@@ -427,40 +583,144 @@ function clearText(){
   ws.send(JSON.stringify({action:"clear_text"}));
 }
 
-let lastProgSent = 0;
-function sendProgress(p){
-  const now = Date.now();
-  if(now - lastProgSent < 160) return;
-  lastProgSent = now;
-  ws.send(JSON.stringify({action:"progress", progress: p}));
+function updatePool(){
+  if(!ws) return;
+  ws.send(JSON.stringify({action:"set_pool", text_list: document.getElementById("textList").value}));
 }
 
-document.addEventListener("input", (e)=>{
-  if(e.target && e.target.id === "input"){
-    sendProgress(e.target.value.length);
+function clearPool(){
+  if(!ws) return;
+  ws.send(JSON.stringify({action:"clear_pool"}));
+}
+
+let lastSent = 0;
+function sendTypeUpdate(typed){
+  const now = Date.now();
+  if(now - lastSent < 80) return; // throttle
+  lastSent = now;
+  ws.send(JSON.stringify({action:"type", typed}));
+}
+
+document.getElementById("input").addEventListener("input", (e)=>{
+  if(!promptText) return;
+  let typed = e.target.value;
+
+  const i = correctPrefix(promptText, typed);
+  if(i < typed.length){
+    e.target.classList.add("bad");
+    typed = typed.slice(0, i);
+    e.target.value = typed;
+  } else {
+    e.target.classList.remove("bad");
+  }
+
+  lastGood = typed;
+  renderPromptHighlight();
+  sendTypeUpdate(typed);
+
+  if(promptText && typed.length === promptText.length){
+    ws.send(JSON.stringify({action:"finish", typed}));
+    e.target.disabled = true;
   }
 });
 
-function finish(){
-  const typed = document.getElementById("input").value;
-  ws.send(JSON.stringify({action:"finish", typed}));
-  document.getElementById("input").disabled = true;
-  document.getElementById("finishBtn").disabled = true;
-  setStatus("Submitted ✅");
+
+/* ---------- Podium + Confetti ---------- */
+let confettiAnim = null;
+let confettiParts = [];
+
+function showPodium(podium){
+  const medals = ["🥇","🥈","🥉"];
+  const lines = (podium || []).map((p, idx)=>{
+    const name = p.name;
+    const t = (p.finish_time !== null && p.finish_time !== undefined) ? `${p.finish_time.toFixed(2)}s` : "DNF";
+    const w = (p.net_wpm ?? p.wpm_live ?? 0);
+    return `${medals[idx]} <b>${escapeHtml(name)}</b> — ${t} — WPM: ${Number(w).toFixed(1)}`;
+  }).join("<br>");
+
+  document.getElementById("podiumList").innerHTML = lines || "No results yet.";
+  document.getElementById("podiumOverlay").style.display = "block";
+  podiumShown = true;
+  startConfetti();
+}
+
+function closePodium(){
+  document.getElementById("podiumOverlay").style.display = "none";
+  stopConfetti();
+}
+
+function startConfetti(){
+  const canvas = document.getElementById("confetti");
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  canvas.width = Math.floor(window.innerWidth * dpr);
+  canvas.height = Math.floor(window.innerHeight * dpr);
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+
+  const colors = ["#ff4d4d","#ffd24d","#4dff88","#4dd2ff","#9b4dff","#ff4df2"];
+  confettiParts = Array.from({length: 200}, () => ({
+    x: Math.random()*window.innerWidth,
+    y: -20 - Math.random()*window.innerHeight*0.2,
+    vx: (Math.random()-0.5)*6,
+    vy: 3 + Math.random()*6,
+    size: 6 + Math.random()*7,
+    rot: Math.random()*Math.PI,
+    vr: (Math.random()-0.5)*0.3,
+    color: colors[Math.floor(Math.random()*colors.length)],
+  }));
+
+  const start = performance.now();
+  function frame(now){
+    ctx.clearRect(0,0,window.innerWidth,window.innerHeight);
+    for(const p of confettiParts){
+      p.x += p.vx; p.y += p.vy; p.rot += p.vr;
+      if(p.y > window.innerHeight + 40) p.y = -40;
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      ctx.fillStyle = p.color;
+      ctx.fillRect(-p.size/2, -p.size/2, p.size, p.size);
+      ctx.restore();
+    }
+    if(now - start < 3000){
+      confettiAnim = requestAnimationFrame(frame);
+    } else {
+      stopConfetti();
+    }
+  }
+  stopConfetti();
+  confettiAnim = requestAnimationFrame(frame);
+}
+
+function stopConfetti(){
+  if(confettiAnim) cancelAnimationFrame(confettiAnim);
+  confettiAnim = null;
+  confettiParts = [];
+  const canvas = document.getElementById("confetti");
+  if(canvas){
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+  }
 }
 </script>
 </body>
 </html>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTMLResponse(HTML)
 
 
+# Optional: eliminate Render health-check HEAD 405 noise
+@app.head("/")
+async def head_root():
+    return ""
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # Standard FastAPI WebSocket lifecycle: accept -> loop receive/send [1](https://fastapi.tiangolo.com/advanced/websockets/)
     await websocket.accept()
 
     room_id = (websocket.query_params.get("room") or "default").strip()
@@ -493,12 +753,12 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "set_text":
                 starter = room.players_by_ws.get(websocket)
                 if starter != room.host:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Only host can change text."}))
+                    await websocket.send_text(json.dumps({"type": "error", "message": "Only host can change single text."}))
                     continue
 
                 new_text = (data.get("text") or "").strip()
                 if len(new_text) < 10:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Text too short (min 10 chars)."}))
+                    await websocket.send_text(json.dumps({"type":"error","message":"Text too short (min 10 chars)."}))
                     continue
 
                 room.text_override = new_text
@@ -508,26 +768,53 @@ async def websocket_endpoint(websocket: WebSocket):
             elif action == "clear_text":
                 starter = room.players_by_ws.get(websocket)
                 if starter != room.host:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Only host can clear text."}))
+                    await websocket.send_text(json.dumps({"type":"error","message":"Only host can clear single text."}))
                     continue
                 room.text_override = ""
                 await broadcast(room_id, {"type": "text_updated"})
                 await broadcast(room_id, {"type": "room", **snapshot(room)})
 
+            elif action == "set_pool":
+                starter = room.players_by_ws.get(websocket)
+                if starter != room.host:
+                    await websocket.send_text(json.dumps({"type":"error","message":"Only host can set paragraph bank."}))
+                    continue
+
+                raw_list = data.get("text_list") or ""
+                pool = parse_paragraphs(raw_list)
+                if not pool:
+                    await websocket.send_text(json.dumps({"type":"error","message":"No valid paragraphs. Separate by blank line."}))
+                    continue
+
+                room.text_pool = pool
+                room.text_bag = []
+                await broadcast(room_id, {"type":"pool_updated", "pool_size": len(room.text_pool)})
+                await broadcast(room_id, {"type":"room", **snapshot(room)})
+
+            elif action == "clear_pool":
+                starter = room.players_by_ws.get(websocket)
+                if starter != room.host:
+                    await websocket.send_text(json.dumps({"type":"error","message":"Only host can clear paragraph bank."}))
+                    continue
+                room.text_pool = []
+                room.text_bag = []
+                await broadcast(room_id, {"type":"pool_updated", "pool_size": 0})
+                await broadcast(room_id, {"type":"room", **snapshot(room)})
+
             elif action == "start_countdown":
                 starter = room.players_by_ws.get(websocket)
                 if starter != room.host:
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Only host can start countdown."}))
+                    await websocket.send_text(json.dumps({"type":"error","message":"Only host can start countdown."}))
                     continue
 
                 if room.countdown_task and not room.countdown_task.done():
-                    await websocket.send_text(json.dumps({"type": "error", "message": "Countdown already running."}))
+                    await websocket.send_text(json.dumps({"type":"error","message":"Countdown already running."}))
                     continue
 
                 if not all_connected_ready(room):
                     await websocket.send_text(json.dumps({
-                        "type": "error",
-                        "message": "Not everyone is READY yet (Ready must equal Connected)."
+                        "type":"error",
+                        "message":"Not everyone is READY yet (Ready must equal Connected)."
                     }))
                     continue
 
@@ -535,30 +822,60 @@ async def websocket_endpoint(websocket: WebSocket):
                     run_countdown_then_start(room_id, DEFAULT_COUNTDOWN)
                 )
 
-            elif action == "progress":
+            elif action == "type":
+                # live typing update
                 pname = room.players_by_ws.get(websocket)
-                if not pname:
+                if not pname or not room.started or not room.text:
                     continue
-                prog = int(data.get("progress", 0))
-                room.players[pname].progress = max(0, prog)
-                await broadcast(room_id, {"type": "progress", "name": pname, "progress": room.players[pname].progress})
+
+                typed = data.get("typed", "")
+                ps = room.players[pname]
+
+                ps.progress = correct_prefix_len(room.text, typed)
+
+                elapsed = max(0.001, time.time() - room.start_time)
+                minutes = elapsed / 60.0
+                ps.wpm_live = round(((ps.progress / 5.0) / minutes), 1)
+
+                await broadcast(room_id, {"type": "state", **snapshot(room)})
 
             elif action == "finish":
                 pname = room.players_by_ws.get(websocket)
                 if not pname or not room.started:
                     continue
+
                 typed = data.get("typed", "")
-                elapsed = max(0.001, time.time() - room.start_time)
-
-                gwpm, nwpm, acc = compute_metrics(room.text, typed, elapsed)
                 ps = room.players[pname]
-                ps.done = True
-                ps.gross_wpm = gwpm
-                ps.net_wpm = nwpm
-                ps.accuracy = acc
-                ps.progress = len(typed)
 
-                await broadcast(room_id, {"type": "leaderboard", **snapshot(room)})
+                elapsed = max(0.001, time.time() - room.start_time)
+                ps.progress = correct_prefix_len(room.text, typed)
+                ps.done = (ps.progress == len(room.text))
+
+                if ps.done and ps.finish_time is None:
+                    ps.finish_time = elapsed
+                    gwpm, nwpm, acc = compute_final_metrics(room.text, typed, elapsed)
+                    ps.gross_wpm, ps.net_wpm, ps.accuracy = gwpm, nwpm, acc
+
+                # Broadcast leaderboard update
+                snap = snapshot(room)
+
+                # If top-3 exists OR everyone finished -> broadcast podium once
+                podium = compute_podium(room)
+                connected = connected_player_names(room)
+                all_done_connected = connected and all(room.players.get(n) and room.players[n].done for n in connected)
+
+                if (len(podium) >= 3 or all_done_connected) and not room.podium_broadcasted:
+                    room.podium_broadcasted = True
+                    snap["podium"] = [
+                        {
+                            "name": n,
+                            "finish_time": ps.finish_time,
+                            "net_wpm": ps.net_wpm,
+                            "wpm_live": ps.wpm_live,
+                        } for (n, ps) in podium
+                    ]
+
+                await broadcast(room_id, {"type": "leaderboard", **snap})
 
     except WebSocketDisconnect:
         pass
@@ -566,7 +883,6 @@ async def websocket_endpoint(websocket: WebSocket):
         room.clients.discard(websocket)
         room.players_by_ws.pop(websocket, None)
 
-        # If host left, pick another (first existing player)
         if room.host == name:
             room.host = next(iter(room.players.keys()), None)
 
