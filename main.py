@@ -314,10 +314,11 @@ function renderBoard(){
 }
 
 function wsUrl(){
-  const host = window.location.host; // HOST_IP:8000
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  const host = window.location.host; // e.g. typing-game.onrender.com
   const r = encodeURIComponent(document.getElementById("room").value.trim());
   const n = encodeURIComponent(document.getElementById("name").value.trim());
-  return `ws://${host}/ws?room=${r}&name=${n}`;
+  return `${protocol}://${host}/ws?room=${r}&name=${n}`;
 }
 
 function join(){
