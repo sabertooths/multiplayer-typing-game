@@ -193,11 +193,11 @@ def room_snapshot(room: Room) -> dict:
         "pool_count": len(room.text_pool),
     }
 
+from typing import List  # make sure this import exists
 
-def normalize_text_pool(raw: str) -> Listlines = [ln.strip() for ln in (raw or "").splitlines()]
-    lines = [ln for ln in lines if ln]
-    return lines
-
+def normalize_text_pool(raw: str) -> List[str]:
+    lines = [ln.strip() for ln in (raw or "").splitlines()]
+    return [ln for ln in lines if ln]
 
 def pick_text(room: Room) -> str:
     if room.text_pool:
@@ -219,12 +219,15 @@ def auto_assign_teams(room: Room):
         room.players[n].team = "A" if i % 2 == 0 else "B"
 
 
-def build_relay_segments(text: str, n_segments: int) -> Listwords = text.split(" ")
+def build_relay_segments(text: str, n_segments: int) -> List[str]:
+    words = text.split(" ")
     if n_segments <= 1 or len(words) <= 1:
         return [text]
+
     base = len(words) // n_segments
     rem = len(words) % n_segments
-    segs = []
+
+    segs: List[str] = []
     idx = 0
     for k in range(n_segments):
         take = base + (1 if k < rem else 0)
